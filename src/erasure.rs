@@ -1,11 +1,15 @@
-use reed_solomon_erasure::galois_8::ReedSolomon;
 use anyhow::{Result, anyhow};
+use reed_solomon_erasure::galois_8::ReedSolomon;
 
 /// Encodes data into data_shards + parity_shards.
-/// 
+///
 /// Returns a vector of shards.
 /// The original data length is prepended (u64 little endian).
 pub fn encode(data: &[u8], data_shards: usize, parity_shards: usize) -> Result<Vec<Vec<u8>>> {
+    if data_shards == 0 {
+        return Err(anyhow!("data_shards must be greater than zero"));
+    }
+
     let r = ReedSolomon::new(data_shards, parity_shards)
         .map_err(|e| anyhow!("Failed to initialize ReedSolomon: {}", e))?;
 
@@ -17,13 +21,14 @@ pub fn encode(data: &[u8], data_shards: usize, parity_shards: usize) -> Result<V
 
     // 2. Pad to multiple of data_shards
     let total_len = buffer.len();
-    let shard_size = (total_len + data_shards - 1) / data_shards;
+    let shard_size = total_len.div_ceil(data_shards);
     let padded_len = shard_size * data_shards;
-    
+
     buffer.resize(padded_len, 0);
 
     // 3. Split into shards
-    let mut shards: Vec<Vec<u8>> = buffer.chunks(shard_size)
+    let mut shards: Vec<Vec<u8>> = buffer
+        .chunks(shard_size)
         .map(|chunk| chunk.to_vec())
         .collect();
 
@@ -42,33 +47,56 @@ pub fn encode(data: &[u8], data_shards: usize, parity_shards: usize) -> Result<V
 }
 
 /// Reconstructs original data from a subset of shards.
-/// 
-/// `shards` must be a vector of `data_shards + parity_shards` options. 
-pub fn reconstruct(shards: Vec<Option<Vec<u8>>>, data_shards: usize, parity_shards: usize) -> Result<Vec<u8>> {
-    let total_shards = data_shards + parity_shards;
+///
+/// `shards` must be a vector of `data_shards + parity_shards` options.
+pub fn reconstruct(
+    shards: Vec<Option<Vec<u8>>>,
+    data_shards: usize,
+    parity_shards: usize,
+) -> Result<Vec<u8>> {
+    if data_shards == 0 {
+        return Err(anyhow!("data_shards must be greater than zero"));
+    }
+
+    let total_shards = data_shards
+        .checked_add(parity_shards)
+        .ok_or_else(|| anyhow!("Shard count overflow"))?;
     if shards.len() != total_shards {
-        return Err(anyhow!("Must provide exactly {} shard containers (Some or None)", total_shards));
+        return Err(anyhow!(
+            "Must provide exactly {} shard containers (Some or None)",
+            total_shards
+        ));
     }
 
     let r = ReedSolomon::new(data_shards, parity_shards)
         .map_err(|e| anyhow!("Failed to initialize RS: {}", e))?;
 
     // Check shard lengths
-    let _shard_len = shards.iter().find_map(|s| s.as_ref().map(|v| v.len()))
+    let shard_len = shards
+        .iter()
+        .find_map(|s| s.as_ref().map(|v| v.len()))
         .ok_or(anyhow!("No shards provided"))?;
+    if shard_len == 0 {
+        return Err(anyhow!("Shard length must be greater than zero"));
+    }
+    for shard in shards.iter().flatten() {
+        if shard.len() != shard_len {
+            return Err(anyhow!("Shard length mismatch"));
+        }
+    }
 
-    let mut recon_shards = shards.clone();
+    let mut recon_shards = shards;
 
     r.reconstruct(&mut recon_shards)
         .map_err(|e| anyhow!("Reconstruction failed: {}", e))?;
 
     // Extract data
     let mut result = Vec::new();
-    for i in 0..data_shards {
-        if let Some(shard) = &recon_shards[i] {
+    for (i, shard) in recon_shards.iter().enumerate().take(data_shards) {
+        if let Some(shard) = shard {
             result.extend_from_slice(shard);
         } else {
-             return Err(anyhow!("Failed to reconstruct data shard {}", i));
+            return Err(anyhow!("Failed to reconstruct data shard {}", i));
         }
     }
 
@@ -81,10 +109,10 @@ pub fn reconstruct(shards: Vec<Option<Vec<u8>>>, data_shards: usize, parity_shar
     let original_len = u64::from_le_bytes(len_bytes) as usize;
 
     if result.len() < 8 + original_len {
-         return Err(anyhow!("Reconstructed data length mismatch"));
+        return Err(anyhow!("Reconstructed data length mismatch"));
     }
 
-    Ok(result[8..8+original_len].to_vec())
+    Ok(result[8..8 + original_len].to_vec())
 }
 
 #[cfg(test)]
@@ -95,7 +123,7 @@ mod tests {
     fn test_erasure_round_trip() {
         let data = b"Ironclad Stack Resilience Test Data";
         let shards = encode(data, 4, 8).expect("Encode failed");
-        
+
         assert_eq!(shards.len(), 12);
 
         // Simulate loss: Keep only 4 shards (e.g., 0, 5, 8, 11)
@@ -136,7 +164,7 @@ mod tests {
         for i in 0..11 {
             partial[i] = Some(shards[i].clone());
         }
-        
+
         let recovered = reconstruct(partial, 10, 2).unwrap();
         assert_eq!(data.as_slice(), recovered.as_slice());
     }

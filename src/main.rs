@@ -1,272 +1,188 @@
-use anyhow::{Context, Result, anyhow};
-use ironclad::{aont, erasure, integrity::Manifest};
-use std::env;
+use anyhow::{Result, anyhow};
+use clap::{Parser, Subcommand};
+use ironclad::block_store::BlockStore;
 use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 
 const STORAGE_DIR: &str = "storage";
+const DEFAULT_DATA_SHARDS: usize = 4;
+const DEFAULT_PARITY_SHARDS: usize = 4;
+
+#[derive(Parser, Debug)]
+#[command(name = "ironclad", about = "Ironclad Stack CLI")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Encrypt and disperse a file into a dataset
+    Write {
+        input_file: PathBuf,
+        #[arg(
+            short = 'd',
+            long = "data",
+            default_value_t = DEFAULT_DATA_SHARDS
+        )]
+        data: usize,
+        #[arg(
+            short = 'p',
+            long = "parity",
+            default_value_t = DEFAULT_PARITY_SHARDS
+        )]
+        parity: usize,
+        #[arg(long, default_value = "default")]
+        dataset: String,
+    },
+    /// Recover and decrypt a dataset into an output file
+    Read {
+        output_file: PathBuf,
+        #[arg(long, default_value = "default")]
+        dataset: String,
+    },
+    /// Insert text at byte offset
+    Insert {
+        offset: u64,
+        text: String,
+        #[arg(
+            short = 'd',
+            long = "data",
+            default_value_t = DEFAULT_DATA_SHARDS
+        )]
+        data: usize,
+        #[arg(
+            short = 'p',
+            long = "parity",
+            default_value_t = DEFAULT_PARITY_SHARDS
+        )]
+        parity: usize,
+        #[arg(long, default_value = "default")]
+        dataset: String,
+    },
+    /// Delete a byte range
+    Delete {
+        offset: u64,
+        length: u64,
+        #[arg(long, default_value = "default")]
+        dataset: String,
+    },
+}
 
 fn main() -> Result<()> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        print_usage();
-        return Ok(());
-    }
+    let cli = Cli::parse();
 
-    let command = &args[1];
+    match cli.command {
+        Commands::Write {
+            input_file,
+            data,
+            parity,
+            dataset,
+        } => {
+            validate_shard_config(data, parity)?;
+            let dataset_path = dataset_path(&dataset)?;
+            fs::create_dir_all(&dataset_path)?;
 
-    match command.as_str() {
-        "write" => {
-            // Primitive arg parsing
-            if args.len() < 3 {
-                println!("Usage: cargo run -- write <file> [--data <N> --parity <M>]");
-                return Ok(());
-            }
-            let input_path = &args[2];
+            let data_bytes = fs::read(&input_file)?;
+            let file_name = input_file
+                .file_name()
+                .ok_or_else(|| anyhow!("Input path has no file name: {}", input_file.display()))?
+                .to_string_lossy()
+                .into_owned();
 
-            // Defaults
-            let mut data_shards = 4;
-            let mut parity_shards = 4;
-
-            let mut i = 3;
-            while i < args.len() {
-                match args[i].as_str() {
-                    "--data" | "-d" => {
-                        if i + 1 < args.len() {
-                            data_shards = args[i + 1].parse()?;
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                    "--parity" | "-p" => {
-                        if i + 1 < args.len() {
-                            parity_shards = args[i + 1].parse()?;
-                            i += 2;
-                        } else {
-                            i += 1;
-                        }
-                    }
-                    _ => i += 1,
-                }
-            }
-
-            write_file(input_path, data_shards, parity_shards)?;
+            let mut store = BlockStore::create(dataset_path, &file_name)?;
+            store.insert_at(0, &data_bytes, data, parity)?;
+            store.save_manifest()?;
+            println!(
+                "Write complete. Dataset: {}, total size: {}",
+                dataset, store.manifest.total_size
+            );
         }
-        "read" => {
-            if args.len() < 3 {
-                println!("Usage: cargo run -- read <file>");
-                return Ok(());
+        Commands::Read {
+            output_file,
+            dataset,
+        } => {
+            let store = BlockStore::open(dataset_path(&dataset)?)?;
+            if store.manifest.blocks.is_empty() {
+                return Err(anyhow!("Dataset '{}' has no blocks to read", dataset));
             }
-            let output_path = &args[2];
-            read_file(output_path)?;
+            println!(
+                "Reading dataset '{}' (file '{}', size {})",
+                dataset, store.manifest.file_name, store.manifest.total_size
+            );
+            let data = store.read_at(0, store.manifest.total_size)?;
+            fs::write(output_file, &data)?;
+            println!("Read complete.");
         }
-        "tamper" => {
-            if args.len() < 3 {
-                println!("Usage: cargo run -- tamper <shard_index> [byte_index]");
-                return Ok(());
-            }
-            let index: usize = args[2].parse()?;
-            let byte_index: usize = if args.len() > 3 { args[3].parse()? } else { 0 };
-            tamper_shard(index, byte_index)?;
+        Commands::Insert {
+            offset,
+            text,
+            data,
+            parity,
+            dataset,
+        } => {
+            validate_shard_config(data, parity)?;
+            let mut store = BlockStore::open(dataset_path(&dataset)?)?;
+            store.insert_at(offset, text.as_bytes(), data, parity)?;
+            store.save_manifest()?;
+            println!(
+                "Insert complete. Dataset: {}, new size: {}",
+                dataset, store.manifest.total_size
+            );
         }
-        "delete" => {
-            if args.len() < 3 {
-                println!("Usage: cargo run -- delete <shard_index>");
-                return Ok(());
-            }
-            let index: usize = args[2].parse()?;
-            delete_shard(index)?;
-        }
-        _ => {
-            print_usage();
+        Commands::Delete {
+            offset,
+            length,
+            dataset,
+        } => {
+            let mut store = BlockStore::open(dataset_path(&dataset)?)?;
+            store.delete_range(offset, length)?;
+            store.save_manifest()?;
+            println!(
+                "Delete complete. Dataset: {}, new size: {}",
+                dataset, store.manifest.total_size
+            );
         }
     }
 
     Ok(())
 }
 
-fn print_usage() {
-    println!("Ironclad Stack CLI");
-    println!("Commands:");
-    println!(
-        "  write <file> [-d N] [-p M]  - Encrypt, Encode, and Store file with N data and M parity shards"
-    );
-    println!("  read <output_file>          - Read, Verify, Reconstruct, and Decrypt");
-    println!("  tamper <shard_index>        - Corrupt a shard to test integrity");
-    println!("  delete <shard_index>        - Delete a shard to test erasure coding");
-}
-
-fn write_file(path: &str, data_shards: usize, parity_shards: usize) -> Result<()> {
-    println!("Reading file: {}", path);
-    println!(
-        "Configuration: Data={}, Parity={} (Total={})",
-        data_shards,
-        parity_shards,
-        data_shards + parity_shards
-    );
-
-    let data = fs::read(path).context("Failed to read input file")?;
-    let file_name = Path::new(path)
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy();
-    let original_size = data.len() as u64;
-
-    println!("Phase 1: AONT Transform (Encrypt + Entangle)...");
-    let package = aont::encrypt(&data)?;
-    println!("  - Package size: {} bytes", package.len());
-
-    println!(
-        "Phase 2: Dispersal (Reed-Solomon {}, {})...",
-        data_shards, parity_shards
-    );
-    let shards = erasure::encode(&package, data_shards, parity_shards)?;
-    println!("  - Generated {} shards", shards.len());
-
-    println!("Phase 3: Integrity (Hashing & Manifest)...");
-    // Pass config to Manifest
-    let manifest = Manifest::new(
-        &file_name,
-        original_size,
-        &shards,
-        data_shards,
-        parity_shards,
-    );
-
-    // Storage
-    let storage_path = Path::new(STORAGE_DIR);
-    if !storage_path.exists() {
-        fs::create_dir(storage_path)?;
+fn dataset_path(dataset: &str) -> Result<PathBuf> {
+    if dataset.is_empty() {
+        return Err(anyhow!("Dataset name cannot be empty"));
     }
-
-    // Clear old shards to avoid confusion if we shrink total shards
-    // In a real app we might handle this better, but here we just overwrite/add.
-    // If we went from 12 down to 6, shards 6-11 would remain from old run.
-
-    for (i, shard) in shards.iter().enumerate() {
-        let path = storage_path.join(format!("shard_{}.dat", i));
-        fs::write(&path, shard)?;
-        println!("  - Store shard {}: {} bytes", i, shard.len());
+    if dataset == "." || dataset == ".." {
+        return Err(anyhow!("Dataset name cannot be '.' or '..'"));
     }
-
-    manifest.save_tmr(storage_path)?;
-    println!("Manifest saved (TMR). Write complete.");
-    Ok(())
-}
-
-fn read_file(output_path_str: &str) -> Result<()> {
-    let storage_path = Path::new(STORAGE_DIR);
-
-    println!("Phase 1: Fetching Manifest...");
-    let manifest = Manifest::load_tmr(storage_path).context("Failed to load verified manifest")?;
-    println!(
-        "  - Validated Manifest for '{}' (Size: {})",
-        manifest.file_name, manifest.original_size
-    );
-    println!(
-        "  - Configuration: Data={}, Parity={}",
-        manifest.data_shards, manifest.parity_shards
-    );
-
-    println!("Phase 2: Scavenging Shards...");
-    let total_shards = manifest.data_shards + manifest.parity_shards;
-    let mut collected_shards: Vec<Option<Vec<u8>>> = vec![None; total_shards];
-    let mut valid_count = 0;
-
-    for i in 0..total_shards {
-        let path = storage_path.join(format!("shard_{}.dat", i));
-        if !path.exists() {
-            println!("  [Checking Shard {}] MISSING", i);
-            continue;
-        }
-
-        let data = match fs::read(path) {
-            Ok(d) => d,
-            Err(_) => {
-                println!("  [Checking Shard {}] READ ERROR", i);
-                continue;
-            }
-        };
-
-        if manifest.verify_shard(i, &data) {
-            println!("  [Checking Shard {}] VALID", i);
-            collected_shards[i] = Some(data);
-            valid_count += 1;
-        } else {
-            println!(
-                "  [Checking Shard {}] CORRUPT (Hash mismatch) -> DISCARDING",
-                i
-            );
-        }
-
-        if valid_count >= manifest.data_shards {
-            println!(
-                "  -> Found {} valid shards. Stopping search.",
-                manifest.data_shards
-            );
-            break;
-        }
+    if dataset.contains('/') || dataset.contains('\\') {
+        return Err(anyhow!("Dataset name cannot contain path separators"));
     }
-
-    if valid_count < manifest.data_shards {
+    if !dataset
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(anyhow!(
-            "Critical Failure: Found {} valid shards, need {}. Data is irretrievable.",
-            valid_count,
-            manifest.data_shards
+            "Dataset name must be ASCII alphanumeric, '-' or '_'"
         ));
     }
-
-    println!("Phase 3: Reconstructing...");
-    let recovered_package = erasure::reconstruct(
-        collected_shards,
-        manifest.data_shards,
-        manifest.parity_shards,
-    )?;
-    println!(
-        "  - Reconstructed package size: {} bytes",
-        recovered_package.len()
-    );
-
-    println!("Phase 4: Decrypting (AONT Reverse)...");
-    let decrypted = aont::decrypt(&recovered_package)?;
-
-    println!("Writing output to: {}", output_path_str);
-    fs::write(output_path_str, &decrypted)?;
-
-    println!("Success! Data recovered.");
-    Ok(())
+    Ok(PathBuf::from(STORAGE_DIR).join(dataset))
 }
 
-fn tamper_shard(index: usize, byte_index: usize) -> Result<()> {
-    let path = Path::new(STORAGE_DIR).join(format!("shard_{}.dat", index));
-    if !path.exists() {
-        return Err(anyhow!("Shard {} does not exist", index));
+fn validate_shard_config(data_shards: usize, parity_shards: usize) -> Result<()> {
+    if data_shards == 0 {
+        return Err(anyhow!("data_shards must be greater than zero"));
     }
-
-    let mut data = fs::read(&path)?;
-    if byte_index >= data.len() {
-        return Err(anyhow!("Byte index out of bounds"));
+    if parity_shards == 0 {
+        return Err(anyhow!("parity_shards must be greater than zero"));
     }
-
-    let original = data[byte_index];
-    data[byte_index] ^= 0xFF; // Flip all bits
-    println!(
-        "Tampering shard {}: Changed byte {} from {:02x} to {:02x}",
-        index, byte_index, original, data[byte_index]
-    );
-
-    fs::write(&path, &data)?;
-    Ok(())
-}
-
-fn delete_shard(index: usize) -> Result<()> {
-    let path = Path::new(STORAGE_DIR).join(format!("shard_{}.dat", index));
-    if path.exists() {
-        fs::remove_file(&path)?;
-        println!("Deleted shard {}", index);
-    } else {
-        println!("Shard {} not found", index);
+    let total = data_shards
+        .checked_add(parity_shards)
+        .ok_or_else(|| anyhow!("Shard count overflow"))?;
+    if total > 256 {
+        return Err(anyhow!(
+            "Shard count too large: data + parity must be <= 256"
+        ));
     }
     Ok(())
 }

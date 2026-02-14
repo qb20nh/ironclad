@@ -36,35 +36,35 @@ cargo build --release
 #### 1. Write (Encrypt & Disperse)
 
 ```bash
-cargo run --release -- write <input_file> [--data <N> --parity <M>]
+cargo run --release -- write <input_file> [--data <N> --parity <M> --dataset <name>]
 ```
 
 *Splits the file into `N` data shards and `M` parity shards (Default: N=4, M=4).*
-*Example: `cargo run --release -- write secret.txt --data 10 --parity 2`*
+*Example: `cargo run --release -- write secret.txt --data 10 --parity 2 --dataset archive`*
 
 #### 2. Read (Recover & Decrypt)
 
 ```bash
-cargo run --release -- read <output_file>
+cargo run --release -- read <output_file> [--dataset <name>]
 ```
 
-*Reconstructs the original file from `storage/`.*
+*Reconstructs the original file from `storage/<dataset>/` (default dataset: `default`).*
 
-#### 3. Simulating Corruption (Tamper)
+#### 3. Insert Bytes
 
 ```bash
-cargo run --release -- tamper <shard_index>
+cargo run --release -- insert <offset> <text> [--data <N> --parity <M> --dataset <name>]
 ```
 
-*Corrupts a specific shard to test integrity checks.*
+*Inserts text at byte offset and re-encodes affected blocks.*
 
-#### 4. Simulating Data Loss (Delete)
+#### 4. Delete Range
 
 ```bash
-cargo run --release -- delete <shard_index>
+cargo run --release -- delete <offset> <length> [--dataset <name>]
 ```
 
-*Deletes a shard to test erasure coding resilience.*
+*Deletes a byte range and re-encodes affected blocks.*
 
 ## Security Guarantees
 
