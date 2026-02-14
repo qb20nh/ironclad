@@ -1,6 +1,7 @@
 use crate::aont;
 use crate::erasure;
-use crate::integrity::{BlockMetadata, ConsensusManifest, LegacyManifest, Manifest};
+use crate::integrity::{BlockMetadata, Manifest};
+use crate::io_guard::{self, IoOptions};
 use anyhow::{Result, anyhow};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,23 +9,38 @@ use std::path::{Path, PathBuf};
 pub struct BlockStore {
     root_path: PathBuf,
     pub manifest: Manifest,
+    io_options: IoOptions,
 }
 
 impl BlockStore {
     /// Creates a fresh dataset store.
     /// Existing managed files for this dataset are removed, while unrelated files are preserved.
     pub fn create(root_path: PathBuf, file_name: &str) -> Result<Self> {
+        Self::create_with_options(root_path, file_name, IoOptions::strict())
+    }
+
+    /// Creates a fresh dataset store with explicit I/O options.
+    pub fn create_with_options(
+        root_path: PathBuf,
+        file_name: &str,
+        io_options: IoOptions,
+    ) -> Result<Self> {
         fs::create_dir_all(&root_path)?;
         Self::cleanup_managed_files(&root_path)?;
         Ok(BlockStore {
             root_path,
             manifest: Manifest::new(file_name),
+            io_options,
         })
     }
 
     /// Opens an existing dataset store.
-    /// Supports auto-migration from the legacy single-block manifest format.
     pub fn open(root_path: PathBuf) -> Result<Self> {
+        Self::open_with_options(root_path, IoOptions::strict())
+    }
+
+    /// Opens an existing dataset store with explicit I/O options.
+    pub fn open_with_options(root_path: PathBuf, io_options: IoOptions) -> Result<Self> {
         if !root_path.exists() {
             return Err(anyhow!(
                 "Dataset path does not exist: {}",
@@ -32,34 +48,25 @@ impl BlockStore {
             ));
         }
 
-        let manifest = match Manifest::load_tmr_consensus(&root_path) {
-            Ok(ConsensusManifest::Current(m)) => {
-                m.validate()?;
-                m
-            }
-            Ok(ConsensusManifest::Legacy(m)) => Self::migrate_legacy_manifest(&root_path, &m)?,
-            Err(e) => {
-                if Self::manifest_files_exist(&root_path) {
-                    return Err(anyhow!(
-                        "Manifest exists but could not be loaded (corruption or tampering): {}",
-                        e
-                    ));
-                }
-                return Err(anyhow!(
-                    "Dataset is not initialized: {}",
-                    root_path.display()
-                ));
-            }
-        };
+        let has_manifest = io_guard::manifest_files_exist(&root_path);
+        if !has_manifest {
+            return Err(anyhow!(
+                "Dataset is not initialized: {}",
+                root_path.display()
+            ));
+        }
+
+        let manifest = Manifest::load_tmr_consensus(&root_path)?;
 
         Ok(BlockStore {
             root_path,
             manifest,
+            io_options,
         })
     }
 
     pub fn save_manifest(&self) -> Result<()> {
-        self.manifest.save_tmr(&self.root_path)
+        self.manifest.save_tmr(&self.root_path, self.io_options)
     }
 
     fn cleanup_managed_files(root_path: &Path) -> Result<()> {
@@ -89,56 +96,26 @@ impl BlockStore {
             || (name.starts_with("shard_") && name.ends_with(".dat"))
     }
 
-    fn manifest_files_exist(root_path: &Path) -> bool {
-        (0..3).any(|i| root_path.join(format!("manifest_{}.json", i)).exists())
-    }
-
-    fn migrate_legacy_manifest(root_path: &Path, legacy: &LegacyManifest) -> Result<Manifest> {
-        let manifest = legacy.to_manifest();
-        manifest.validate()?;
-
-        let block = &manifest.blocks[0];
-        let total_shards = block
-            .data_shards
-            .checked_add(block.parity_shards)
-            .ok_or_else(|| anyhow!("Legacy block shard count overflow"))?;
-
-        for i in 0..total_shards {
-            let legacy_path = root_path.join(format!("shard_{}.dat", i));
-            let block_path = root_path.join(format!("block_{}_{}.bin", block.id, i));
-
-            if !legacy_path.exists() {
-                continue;
-            }
-
-            if block_path.exists() {
-                fs::remove_file(legacy_path)?;
-                continue;
-            }
-
-            if fs::rename(&legacy_path, &block_path).is_err() {
-                fs::copy(&legacy_path, &block_path)?;
-                fs::remove_file(legacy_path)?;
-            }
-        }
-
-        manifest.save_tmr(root_path)?;
-        Ok(manifest)
-    }
-
     fn delete_block_files(&self, block: &BlockMetadata) -> Result<()> {
         let total_shards = block
             .data_shards
             .checked_add(block.parity_shards)
             .ok_or_else(|| anyhow!("Block {} shard count overflow", block.id))?;
+        self.delete_block_files_by_id(block.id, total_shards)
+    }
 
+    fn delete_block_files_by_id(&self, block_id: usize, total_shards: usize) -> Result<()> {
         for i in 0..total_shards {
-            let path = self.root_path.join(format!("block_{}_{}.bin", block.id, i));
+            let path = self.root_path.join(format!("block_{}_{}.bin", block_id, i));
             if path.exists() {
                 fs::remove_file(path)?;
             }
         }
         Ok(())
+    }
+
+    fn delete_block_files_best_effort(&self, block: &BlockMetadata) {
+        let _ = self.delete_block_files(block);
     }
 
     /// Encodes data into a new block and saves shards to disk.
@@ -158,18 +135,23 @@ impl BlockStore {
         // 2. Erasure Encode
         let shards = erasure::encode(&package, data_shards, parity_shards)?;
 
-        // 3. Calculate Hashes
-        let mut shard_hashes = Vec::new();
-        for shard in &shards {
-            let hash = blake3::hash(shard).to_hex().to_string();
-            shard_hashes.push(hash);
-        }
-
-        // 4. Save Shards
-        // Naming convention: block_{id}_{shard_index}.bin
+        // 3. Calculate Hashes and save shards with verification
+        let mut shard_hashes = Vec::with_capacity(shards.len());
         for (i, shard) in shards.iter().enumerate() {
+            let hash = blake3::hash(shard).to_hex().to_string();
             let path = self.root_path.join(format!("block_{}_{}.bin", id, i));
-            fs::write(path, shard)?;
+
+            if let Err(e) = io_guard::write_atomic_verified(&path, shard, &hash, self.io_options) {
+                let _ = self.delete_block_files_by_id(id, shards.len());
+                return Err(anyhow!(
+                    "Failed to write shard {} for block {}: {}",
+                    i,
+                    id,
+                    e
+                ));
+            }
+
+            shard_hashes.push(hash);
         }
 
         Ok(BlockMetadata {
@@ -201,21 +183,8 @@ impl BlockStore {
 
         for i in 0..total_shards {
             let path = self.root_path.join(format!("block_{}_{}.bin", block.id, i));
-            // Try check if file exists
-            if path.exists() {
-                let data = fs::read(&path)?;
-                // Verify hash
-                let hash = blake3::hash(&data).to_hex().to_string();
-                if hash == block.shard_hashes[i] {
-                    loaded_shards.push(Some(data));
-                } else {
-                    // Tampered/Corrupted
-                    loaded_shards.push(None);
-                }
-            } else {
-                // Missing
-                loaded_shards.push(None);
-            }
+            let data = io_guard::read_verified(&path, &block.shard_hashes[i], self.io_options)?;
+            loaded_shards.push(data);
         }
 
         // Reconstruct
@@ -301,7 +270,7 @@ impl BlockStore {
     }
 
     /// Insert data at offset.
-    /// This splits the block at `offset` into [Left, Inserted, Right]
+    /// This splits the block at `offset` into [Left, Inserted, Right].
     pub fn insert_at(
         &mut self,
         offset: u64,
@@ -316,19 +285,21 @@ impl BlockStore {
         }
 
         let mut next_id = self.next_available_id()?;
+        let mut next_manifest = self.manifest.clone();
+        let mut obsolete_blocks = Vec::new();
 
-        // Find the block to split
-        let mut current_offset: u64 = 0;
-        let mut split_index = None;
-        let mut split_pos_in_block = 0;
-
-        // If inserting at absolute end, we just append
+        // If inserting at absolute end, we just append.
         if offset == self.manifest.total_size {
             let new_id = Self::take_next_id(&mut next_id)?;
             let new_block = self.create_block(data, new_id, data_shards, parity_shards)?;
-            self.manifest.add_block(new_block);
-            return Ok(());
+            next_manifest.add_block(new_block);
+            return self.commit_manifest(next_manifest, obsolete_blocks);
         }
+
+        // Find the block to split.
+        let mut current_offset: u64 = 0;
+        let mut split_index = None;
+        let mut split_pos_in_block = 0;
 
         for (i, block) in self.manifest.blocks.iter().enumerate() {
             let block_end = current_offset
@@ -353,10 +324,10 @@ impl BlockStore {
         }
         let (left_data, right_data) = full_data.split_at(split_idx);
 
-        // Create new blocks
+        // Create new blocks.
         let mut new_blocks = Vec::new();
 
-        // 1. Left part (if not empty)
+        // 1. Left part (if not empty).
         if !left_data.is_empty() {
             let id = Self::take_next_id(&mut next_id)?;
             new_blocks.push(self.create_block(
@@ -367,11 +338,11 @@ impl BlockStore {
             )?);
         }
 
-        // 2. Inserted part
+        // 2. Inserted part.
         let id = Self::take_next_id(&mut next_id)?;
         new_blocks.push(self.create_block(data, id, data_shards, parity_shards)?);
 
-        // 3. Right part (if not empty)
+        // 3. Right part (if not empty).
         if !right_data.is_empty() {
             let id = Self::take_next_id(&mut next_id)?;
             new_blocks.push(self.create_block(
@@ -382,14 +353,11 @@ impl BlockStore {
             )?);
         }
 
-        // Replace old block with new set
-        self.delete_block_files(&block_to_split)?;
-        self.manifest.blocks.splice(idx..idx + 1, new_blocks);
+        next_manifest.blocks.splice(idx..idx + 1, new_blocks);
+        Self::recalc_total_size(&mut next_manifest)?;
 
-        // Re-calculate total size
-        self.recalc_total_size();
-
-        Ok(())
+        obsolete_blocks.push(block_to_split);
+        self.commit_manifest(next_manifest, obsolete_blocks)
     }
 
     /// Deletes data in range [offset, offset + length).
@@ -410,6 +378,7 @@ impl BlockStore {
         let mut next_id = self.next_available_id()?;
         let mut current_offset: u64 = 0;
         let mut new_blocks = Vec::new();
+        let mut obsolete_blocks = Vec::new();
 
         for block in &self.manifest.blocks {
             let block_start = current_offset;
@@ -444,8 +413,6 @@ impl BlockStore {
                     )?);
                 }
 
-                // Skip Middle (Deleted)
-
                 // Keep Right Part
                 if end_in_block < data.len() {
                     let right_data = &data[end_in_block..];
@@ -458,8 +425,7 @@ impl BlockStore {
                     )?);
                 }
 
-                // Delete old block files
-                self.delete_block_files(block)?;
+                obsolete_blocks.push(block.clone());
             } else {
                 // Not affected, keep as is
                 new_blocks.push(block.clone());
@@ -468,8 +434,31 @@ impl BlockStore {
             current_offset = block_end;
         }
 
-        self.manifest.blocks = new_blocks;
-        self.recalc_total_size();
+        let mut next_manifest = self.manifest.clone();
+        next_manifest.blocks = new_blocks;
+        Self::recalc_total_size(&mut next_manifest)?;
+
+        self.commit_manifest(next_manifest, obsolete_blocks)
+    }
+
+    fn commit_manifest(
+        &mut self,
+        mut next_manifest: Manifest,
+        obsolete_blocks: Vec<BlockMetadata>,
+    ) -> Result<()> {
+        next_manifest.epoch = next_manifest
+            .epoch
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Manifest epoch overflow"))?;
+        next_manifest.validate()?;
+        next_manifest.save_tmr(&self.root_path, self.io_options)?;
+
+        self.manifest = next_manifest;
+
+        for block in &obsolete_blocks {
+            self.delete_block_files_best_effort(block);
+        }
+
         Ok(())
     }
 
@@ -510,7 +499,12 @@ impl BlockStore {
         Ok(id)
     }
 
-    fn recalc_total_size(&mut self) {
-        self.manifest.total_size = self.manifest.blocks.iter().map(|b| b.original_size).sum();
+    fn recalc_total_size(manifest: &mut Manifest) -> Result<()> {
+        manifest.total_size = manifest
+            .blocks
+            .iter()
+            .try_fold(0u64, |acc, block| acc.checked_add(block.original_size))
+            .ok_or_else(|| anyhow!("Manifest total_size overflow"))?;
+        Ok(())
     }
 }

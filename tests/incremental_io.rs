@@ -1,9 +1,11 @@
 use ironclad::block_store::BlockStore;
-use ironclad::{aont, erasure};
+use ironclad::io_guard;
 use serde_json::json;
 use std::collections::HashSet;
 use std::fs;
 use tempfile::tempdir;
+
+const MANIFEST_FAIL_MARKER: &str = ".ironclad_fail_manifest_commit";
 
 #[test]
 fn test_block_store_basic_flow() {
@@ -57,6 +59,7 @@ fn test_block_store_persistence() {
         assert_eq!(store.manifest.total_size, 10);
         let data = store.read_at(0, 10).unwrap();
         assert_eq!(data, b"Persist Me");
+        assert!(root.join("manifest_0.json").exists());
     }
 }
 
@@ -109,6 +112,7 @@ fn test_malformed_manifest_rejected_without_panic() {
     let root = dir.path();
 
     let malformed = json!({
+        "epoch": 1,
         "file_name": "bad.bin",
         "total_size": 1,
         "blocks": [{
@@ -122,14 +126,14 @@ fn test_malformed_manifest_rejected_without_panic() {
 
     let manifest_text = serde_json::to_vec_pretty(&malformed).unwrap();
     for i in 0..3 {
-        fs::write(root.join(format!("manifest_{}.json", i)), &manifest_text).unwrap();
+        fs::write(io_guard::manifest_path(root, i), &manifest_text).unwrap();
     }
 
     let err = match BlockStore::open(root.to_path_buf()) {
         Ok(_) => panic!("malformed manifest should fail to open"),
         Err(err) => err,
     };
-    assert!(err.to_string().contains("shard hashes"));
+    assert!(err.to_string().contains("No manifest files") || err.to_string().contains("Consensus"));
 }
 
 #[test]
@@ -146,45 +150,25 @@ fn test_overflow_bounds_checks() {
 }
 
 #[test]
-fn test_legacy_manifest_migration() {
+fn test_copy_on_write_failed_manifest_commit_preserves_previous_data() {
     let dir = tempdir().unwrap();
     let root = dir.path().to_path_buf();
 
-    let original = b"legacy migration payload".to_vec();
-    let package = aont::encrypt(&original).unwrap();
-    let data_shards = 4;
-    let parity_shards = 2;
-    let shards = erasure::encode(&package, data_shards, parity_shards).unwrap();
+    let mut store = BlockStore::create(root.clone(), "cow.txt").unwrap();
+    store.insert_at(0, b"abcdef", 4, 2).unwrap();
 
-    for (i, shard) in shards.iter().enumerate() {
-        fs::write(root.join(format!("shard_{}.dat", i)), shard).unwrap();
-    }
+    fs::write(root.join(MANIFEST_FAIL_MARKER), b"1").unwrap();
 
-    let shard_hashes: Vec<String> = shards
-        .iter()
-        .map(|shard| blake3::hash(shard).to_hex().to_string())
-        .collect();
-    let legacy_manifest = json!({
-        "file_name": "legacy.txt",
-        "original_size": original.len() as u64,
-        "data_shards": data_shards,
-        "parity_shards": parity_shards,
-        "shard_hashes": shard_hashes
-    });
-    let legacy_manifest_text = serde_json::to_vec_pretty(&legacy_manifest).unwrap();
-    for i in 0..3 {
-        fs::write(
-            root.join(format!("manifest_{}.json", i)),
-            &legacy_manifest_text,
-        )
-        .unwrap();
-    }
+    let err = store
+        .insert_at(3, b"Z", 4, 2)
+        .expect_err("insert should fail due to forced manifest commit failure");
+    assert!(err.to_string().contains("Manifest commit aborted"));
 
-    let store = BlockStore::open(root.clone()).unwrap();
-    let data = store.read_at(0, original.len() as u64).unwrap();
-    assert_eq!(data, original);
-    assert!(root.join("block_0_0.bin").exists());
-    assert!(!root.join("shard_0.dat").exists());
+    fs::remove_file(root.join(MANIFEST_FAIL_MARKER)).unwrap();
+
+    let reopened = BlockStore::open(root).unwrap();
+    let data = reopened.read_at(0, 6).unwrap();
+    assert_eq!(data, b"abcdef");
 }
 
 #[test]

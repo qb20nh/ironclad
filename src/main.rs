@@ -1,12 +1,34 @@
 use anyhow::{Result, anyhow};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use ironclad::block_store::BlockStore;
+use ironclad::io_guard::IoOptions;
 use std::fs;
 use std::path::PathBuf;
 
 const STORAGE_DIR: &str = "storage";
 const DEFAULT_DATA_SHARDS: usize = 4;
 const DEFAULT_PARITY_SHARDS: usize = 4;
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum IoModeArg {
+    Strict,
+    Fast,
+}
+
+impl Default for IoModeArg {
+    fn default() -> Self {
+        Self::Strict
+    }
+}
+
+impl IoModeArg {
+    fn to_io_options(self) -> IoOptions {
+        match self {
+            IoModeArg::Strict => IoOptions::strict(),
+            IoModeArg::Fast => IoOptions::fast(),
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "ironclad", about = "Ironclad Stack CLI")]
@@ -34,12 +56,16 @@ enum Commands {
         parity: usize,
         #[arg(long, default_value = "default")]
         dataset: String,
+        #[arg(long = "io-mode", value_enum, default_value_t = IoModeArg::Strict)]
+        io_mode: IoModeArg,
     },
     /// Recover and decrypt a dataset into an output file
     Read {
         output_file: PathBuf,
         #[arg(long, default_value = "default")]
         dataset: String,
+        #[arg(long = "io-mode", value_enum, default_value_t = IoModeArg::Strict)]
+        io_mode: IoModeArg,
     },
     /// Insert text at byte offset
     Insert {
@@ -59,6 +85,8 @@ enum Commands {
         parity: usize,
         #[arg(long, default_value = "default")]
         dataset: String,
+        #[arg(long = "io-mode", value_enum, default_value_t = IoModeArg::Strict)]
+        io_mode: IoModeArg,
     },
     /// Delete a byte range
     Delete {
@@ -66,6 +94,8 @@ enum Commands {
         length: u64,
         #[arg(long, default_value = "default")]
         dataset: String,
+        #[arg(long = "io-mode", value_enum, default_value_t = IoModeArg::Strict)]
+        io_mode: IoModeArg,
     },
 }
 
@@ -78,6 +108,7 @@ fn main() -> Result<()> {
             data,
             parity,
             dataset,
+            io_mode,
         } => {
             validate_shard_config(data, parity)?;
             let dataset_path = dataset_path(&dataset)?;
@@ -90,9 +121,9 @@ fn main() -> Result<()> {
                 .to_string_lossy()
                 .into_owned();
 
-            let mut store = BlockStore::create(dataset_path, &file_name)?;
+            let mut store =
+                BlockStore::create_with_options(dataset_path, &file_name, io_mode.to_io_options())?;
             store.insert_at(0, &data_bytes, data, parity)?;
-            store.save_manifest()?;
             println!(
                 "Write complete. Dataset: {}, total size: {}",
                 dataset, store.manifest.total_size
@@ -101,8 +132,10 @@ fn main() -> Result<()> {
         Commands::Read {
             output_file,
             dataset,
+            io_mode,
         } => {
-            let store = BlockStore::open(dataset_path(&dataset)?)?;
+            let store =
+                BlockStore::open_with_options(dataset_path(&dataset)?, io_mode.to_io_options())?;
             if store.manifest.blocks.is_empty() {
                 return Err(anyhow!("Dataset '{}' has no blocks to read", dataset));
             }
@@ -120,11 +153,12 @@ fn main() -> Result<()> {
             data,
             parity,
             dataset,
+            io_mode,
         } => {
             validate_shard_config(data, parity)?;
-            let mut store = BlockStore::open(dataset_path(&dataset)?)?;
+            let mut store =
+                BlockStore::open_with_options(dataset_path(&dataset)?, io_mode.to_io_options())?;
             store.insert_at(offset, text.as_bytes(), data, parity)?;
-            store.save_manifest()?;
             println!(
                 "Insert complete. Dataset: {}, new size: {}",
                 dataset, store.manifest.total_size
@@ -134,10 +168,11 @@ fn main() -> Result<()> {
             offset,
             length,
             dataset,
+            io_mode,
         } => {
-            let mut store = BlockStore::open(dataset_path(&dataset)?)?;
+            let mut store =
+                BlockStore::open_with_options(dataset_path(&dataset)?, io_mode.to_io_options())?;
             store.delete_range(offset, length)?;
-            store.save_manifest()?;
             println!(
                 "Delete complete. Dataset: {}, new size: {}",
                 dataset, store.manifest.total_size

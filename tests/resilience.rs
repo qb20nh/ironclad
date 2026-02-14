@@ -76,3 +76,33 @@ fn test_resilience_erasure_loss_blockstore() {
         .expect("Recover failed");
     assert_eq!(original_data, recovered);
 }
+
+#[test]
+fn test_resilience_mixed_loss_and_corruption_blockstore() {
+    let dir = tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    let original_data = generate_random_data(400 * 1024);
+    let mut store = BlockStore::create(root.clone(), "mixed.txt").unwrap();
+    store
+        .insert_at(0, &original_data, 4, 8)
+        .expect("Insert failed");
+    let block_id = store.manifest.blocks[0].id;
+
+    // Lose 3 shards entirely.
+    for i in 0..3 {
+        let path = root.join(format!("block_{}_{}.bin", block_id, i));
+        fs::remove_file(path).expect("Failed to delete shard");
+    }
+
+    // Corrupt 2 additional shards.
+    for i in 3..5 {
+        let path = root.join(format!("block_{}_{}.bin", block_id, i));
+        corrupt_file(&path, 16);
+    }
+
+    let recovered = store
+        .read_at(0, original_data.len() as u64)
+        .expect("Recover failed");
+    assert_eq!(original_data, recovered);
+}
