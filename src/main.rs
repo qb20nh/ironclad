@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand, ValueEnum};
 use ironclad::block_store::BlockStore;
 use ironclad::io_guard::IoOptions;
+use ironclad::key_material::RootKey;
 use std::fs;
 use std::path::PathBuf;
 
@@ -33,6 +34,8 @@ impl IoModeArg {
 #[derive(Parser, Debug)]
 #[command(name = "ironclad", about = "Ironclad Stack CLI")]
 struct Cli {
+    #[arg(long = "root-key-hex", global = true)]
+    root_key_hex: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -101,6 +104,7 @@ enum Commands {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let root_key = resolve_root_key(&cli)?;
 
     match cli.command {
         Commands::Write {
@@ -121,8 +125,12 @@ fn main() -> Result<()> {
                 .to_string_lossy()
                 .into_owned();
 
-            let mut store =
-                BlockStore::create_with_options(dataset_path, &file_name, io_mode.to_io_options())?;
+            let mut store = BlockStore::create_with_options(
+                dataset_path,
+                &file_name,
+                root_key,
+                io_mode.to_io_options(),
+            )?;
             store.insert_at(0, &data_bytes, data, parity)?;
             println!(
                 "Write complete. Dataset: {}, total size: {}",
@@ -134,8 +142,11 @@ fn main() -> Result<()> {
             dataset,
             io_mode,
         } => {
-            let store =
-                BlockStore::open_with_options(dataset_path(&dataset)?, io_mode.to_io_options())?;
+            let store = BlockStore::open_with_options(
+                dataset_path(&dataset)?,
+                root_key,
+                io_mode.to_io_options(),
+            )?;
             if store.manifest.blocks.is_empty() {
                 return Err(anyhow!("Dataset '{}' has no blocks to read", dataset));
             }
@@ -156,8 +167,11 @@ fn main() -> Result<()> {
             io_mode,
         } => {
             validate_shard_config(data, parity)?;
-            let mut store =
-                BlockStore::open_with_options(dataset_path(&dataset)?, io_mode.to_io_options())?;
+            let mut store = BlockStore::open_with_options(
+                dataset_path(&dataset)?,
+                root_key,
+                io_mode.to_io_options(),
+            )?;
             store.insert_at(offset, text.as_bytes(), data, parity)?;
             println!(
                 "Insert complete. Dataset: {}, new size: {}",
@@ -170,8 +184,11 @@ fn main() -> Result<()> {
             dataset,
             io_mode,
         } => {
-            let mut store =
-                BlockStore::open_with_options(dataset_path(&dataset)?, io_mode.to_io_options())?;
+            let mut store = BlockStore::open_with_options(
+                dataset_path(&dataset)?,
+                root_key,
+                io_mode.to_io_options(),
+            )?;
             store.delete_range(offset, length)?;
             println!(
                 "Delete complete. Dataset: {}, new size: {}",
@@ -220,4 +237,18 @@ fn validate_shard_config(data_shards: usize, parity_shards: usize) -> Result<()>
         ));
     }
     Ok(())
+}
+
+fn resolve_root_key(cli: &Cli) -> Result<[u8; 32]> {
+    let raw = cli
+        .root_key_hex
+        .clone()
+        .or_else(|| std::env::var("IRONCLAD_ROOT_KEY_HEX").ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "Root key required: provide --root-key-hex or set IRONCLAD_ROOT_KEY_HEX (64 hex chars)"
+            )
+        })?;
+
+    Ok(RootKey::from_hex(&raw)?.0)
 }

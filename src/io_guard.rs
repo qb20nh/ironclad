@@ -6,11 +6,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const MANIFEST_PREFIX: &str = "manifest_";
-pub const MANIFEST_SUFFIX: &str = ".json";
-const MANIFEST_COPIES: usize = 3;
-const TEST_MANIFEST_FAIL_MARKER: &str = ".ironclad_fail_manifest_commit";
-
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,35 +54,6 @@ impl Default for IoOptions {
     fn default() -> Self {
         Self::strict()
     }
-}
-
-pub fn manifest_path(base_path: &Path, idx: usize) -> PathBuf {
-    base_path.join(format!("{}{}{}", MANIFEST_PREFIX, idx, MANIFEST_SUFFIX))
-}
-
-pub fn manifest_files_exist(base_path: &Path) -> bool {
-    (0..MANIFEST_COPIES).any(|i| manifest_path(base_path, i).exists())
-}
-
-pub fn write_manifest_triplet_verified(
-    base_path: &Path,
-    manifest_bytes: &[u8],
-    options: IoOptions,
-) -> Result<()> {
-    let fail_marker = base_path.join(TEST_MANIFEST_FAIL_MARKER);
-    if fail_marker.exists() {
-        return Err(anyhow!(
-            "Manifest commit aborted due to failure marker: {}",
-            fail_marker.display()
-        ));
-    }
-
-    let expected_hash = blake3::hash(manifest_bytes).to_hex().to_string();
-    for i in 0..MANIFEST_COPIES {
-        let path = manifest_path(base_path, i);
-        write_atomic_verified(&path, manifest_bytes, &expected_hash, options)?;
-    }
-    Ok(())
 }
 
 pub fn read_verified(
@@ -244,30 +210,6 @@ mod tests {
         let result =
             read_verified(&path, "bad-hash", IoOptions::strict()).expect("read should not error");
         assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_write_manifest_triplet_verified_writes_manifest_files() {
-        let dir = tempdir().expect("tempdir");
-        let bytes = b"{}";
-
-        write_manifest_triplet_verified(dir.path(), bytes, IoOptions::strict()).expect("commit");
-
-        for i in 0..3 {
-            let path = manifest_path(dir.path(), i);
-            assert!(path.exists());
-            assert_eq!(fs::read(&path).expect("read"), bytes);
-        }
-    }
-
-    #[test]
-    fn test_write_manifest_triplet_verified_failure_marker() {
-        let dir = tempdir().expect("tempdir");
-        fs::write(dir.path().join(TEST_MANIFEST_FAIL_MARKER), b"1").expect("marker");
-
-        let err = write_manifest_triplet_verified(dir.path(), b"{}", IoOptions::strict())
-            .expect_err("manifest commit should fail");
-        assert!(err.to_string().contains("failure marker"));
     }
 
     #[test]

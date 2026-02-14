@@ -1,28 +1,43 @@
 use crate::aont;
+use crate::chunk_format::{self, ChunkEnvelope, ChunkKind};
 use crate::erasure;
 use crate::integrity::{BlockMetadata, Manifest};
 use crate::io_guard::{self, IoOptions};
+use crate::key_material::{DerivedKeys, RootKey};
+use crate::manifest_recovery;
 use anyhow::{Result, anyhow};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+const METADATA_COPY_TARGET: usize = 3;
+const TEST_MANIFEST_FAIL_MARKER: &str = ".ironclad_fail_manifest_commit";
+
+#[derive(Debug, Clone)]
+struct PendingBlock {
+    metadata: BlockMetadata,
+    shards: Vec<Vec<u8>>,
+}
+
+#[derive(Debug)]
 pub struct BlockStore {
     root_path: PathBuf,
     pub manifest: Manifest,
     io_options: IoOptions,
+    derived_keys: DerivedKeys,
 }
 
 impl BlockStore {
     /// Creates a fresh dataset store.
     /// Existing managed files for this dataset are removed, while unrelated files are preserved.
-    pub fn create(root_path: PathBuf, file_name: &str) -> Result<Self> {
-        Self::create_with_options(root_path, file_name, IoOptions::strict())
+    pub fn create(root_path: PathBuf, file_name: &str, root_key: [u8; 32]) -> Result<Self> {
+        Self::create_with_options(root_path, file_name, root_key, IoOptions::strict())
     }
 
     /// Creates a fresh dataset store with explicit I/O options.
     pub fn create_with_options(
         root_path: PathBuf,
         file_name: &str,
+        root_key: [u8; 32],
         io_options: IoOptions,
     ) -> Result<Self> {
         fs::create_dir_all(&root_path)?;
@@ -31,16 +46,21 @@ impl BlockStore {
             root_path,
             manifest: Manifest::new(file_name),
             io_options,
+            derived_keys: RootKey(root_key).derive(),
         })
     }
 
     /// Opens an existing dataset store.
-    pub fn open(root_path: PathBuf) -> Result<Self> {
-        Self::open_with_options(root_path, IoOptions::strict())
+    pub fn open(root_path: PathBuf, root_key: [u8; 32]) -> Result<Self> {
+        Self::open_with_options(root_path, root_key, IoOptions::strict())
     }
 
     /// Opens an existing dataset store with explicit I/O options.
-    pub fn open_with_options(root_path: PathBuf, io_options: IoOptions) -> Result<Self> {
+    pub fn open_with_options(
+        root_path: PathBuf,
+        root_key: [u8; 32],
+        io_options: IoOptions,
+    ) -> Result<Self> {
         if !root_path.exists() {
             return Err(anyhow!(
                 "Dataset path does not exist: {}",
@@ -48,25 +68,27 @@ impl BlockStore {
             ));
         }
 
-        let has_manifest = io_guard::manifest_files_exist(&root_path);
-        if !has_manifest {
-            return Err(anyhow!(
-                "Dataset is not initialized: {}",
-                root_path.display()
-            ));
-        }
-
-        let manifest = Manifest::load_tmr_consensus(&root_path)?;
+        let derived_keys = RootKey(root_key).derive();
+        let manifest =
+            manifest_recovery::load_manifest_from_chunks(&root_path, &derived_keys.meta_mac_key)
+                .map_err(|err| {
+                    anyhow!(
+                        "Dataset is not initialized: {} ({})",
+                        root_path.display(),
+                        err
+                    )
+                })?;
 
         Ok(BlockStore {
             root_path,
             manifest,
             io_options,
+            derived_keys,
         })
     }
 
     pub fn save_manifest(&self) -> Result<()> {
-        self.manifest.save_tmr(&self.root_path, self.io_options)
+        self.persist_manifest_artifacts(&self.manifest, &[])
     }
 
     fn cleanup_managed_files(root_path: &Path) -> Result<()> {
@@ -93,6 +115,7 @@ impl BlockStore {
     fn is_managed_file(name: &str) -> bool {
         (name.starts_with("manifest_") && name.ends_with(".json"))
             || (name.starts_with("block_") && name.ends_with(".bin"))
+            || (name.starts_with("meta_") && name.ends_with(".bin"))
             || (name.starts_with("shard_") && name.ends_with(".dat"))
     }
 
@@ -118,48 +141,78 @@ impl BlockStore {
         let _ = self.delete_block_files(block);
     }
 
-    /// Encodes data into a new block and saves shards to disk.
-    /// Returns the BlockMetadata.
+    fn cleanup_old_meta_files_best_effort(&self, current_epoch: u64) {
+        let entries = match fs::read_dir(&self.root_path) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        for entry in entries.flatten() {
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(epoch) = Self::parse_meta_epoch(&name) else {
+                continue;
+            };
+            if epoch < current_epoch {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    fn parse_meta_epoch(name: &str) -> Option<u64> {
+        if !name.starts_with("meta_") || !name.ends_with(".bin") {
+            return None;
+        }
+
+        let stem = name.strip_suffix(".bin")?;
+        let mut parts = stem.split('_');
+        if parts.next() != Some("meta") {
+            return None;
+        }
+        let epoch = parts.next()?.parse::<u64>().ok()?;
+        parts.next()?;
+        Some(epoch)
+    }
+
+    /// Encodes data into a new block but keeps output in memory until commit.
     fn create_block(
         &self,
         data: &[u8],
         id: usize,
         data_shards: usize,
         parity_shards: usize,
-    ) -> Result<BlockMetadata> {
+    ) -> Result<PendingBlock> {
         Self::validate_shard_config(data_shards, parity_shards)?;
 
         // 1. AONT Encrypt
-        let package = aont::encrypt(data)?;
+        let package = aont::encrypt(data, &self.derived_keys.aont_mask_key)?;
 
         // 2. Erasure Encode
         let shards = erasure::encode(&package, data_shards, parity_shards)?;
 
-        // 3. Calculate Hashes and save shards with verification
-        let mut shard_hashes = Vec::with_capacity(shards.len());
-        for (i, shard) in shards.iter().enumerate() {
-            let hash = blake3::hash(shard).to_hex().to_string();
-            let path = self.root_path.join(format!("block_{}_{}.bin", id, i));
+        // 3. Calculate Hashes for shard payloads
+        let shard_hashes = shards
+            .iter()
+            .map(|shard| blake3::hash(shard).to_hex().to_string())
+            .collect();
 
-            if let Err(e) = io_guard::write_atomic_verified(&path, shard, &hash, self.io_options) {
-                let _ = self.delete_block_files_by_id(id, shards.len());
-                return Err(anyhow!(
-                    "Failed to write shard {} for block {}: {}",
-                    i,
-                    id,
-                    e
-                ));
-            }
-
-            shard_hashes.push(hash);
-        }
-
-        Ok(BlockMetadata {
-            id,
-            original_size: data.len() as u64,
-            data_shards,
-            parity_shards,
-            shard_hashes,
+        Ok(PendingBlock {
+            metadata: BlockMetadata {
+                id,
+                original_size: data.len() as u64,
+                data_shards,
+                parity_shards,
+                shard_hashes,
+            },
+            shards,
         })
     }
 
@@ -183,15 +236,53 @@ impl BlockStore {
 
         for i in 0..total_shards {
             let path = self.root_path.join(format!("block_{}_{}.bin", block.id, i));
-            let data = io_guard::read_verified(&path, &block.shard_hashes[i], self.io_options)?;
-            loaded_shards.push(data);
+            let envelope_bytes = match fs::read(path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    loaded_shards.push(None);
+                    continue;
+                }
+                Err(_) => {
+                    loaded_shards.push(None);
+                    continue;
+                }
+            };
+
+            let envelope = match chunk_format::decode_envelope(
+                &envelope_bytes,
+                &self.derived_keys.meta_mac_key,
+            ) {
+                Ok(envelope) => envelope,
+                Err(_) => {
+                    loaded_shards.push(None);
+                    continue;
+                }
+            };
+
+            if envelope.kind != ChunkKind::DataShard
+                || envelope.block_id != Some(block.id)
+                || envelope.shard_index != Some(i)
+                || envelope.data_shards != Some(block.data_shards)
+                || envelope.parity_shards != Some(block.parity_shards)
+            {
+                loaded_shards.push(None);
+                continue;
+            }
+
+            let payload_hash = blake3::hash(&envelope.payload).to_hex().to_string();
+            if payload_hash != block.shard_hashes[i] {
+                loaded_shards.push(None);
+                continue;
+            }
+
+            loaded_shards.push(Some(envelope.payload));
         }
 
         // Reconstruct
         let package = erasure::reconstruct(loaded_shards, block.data_shards, block.parity_shards)?;
 
         // Decrypt
-        let data = aont::decrypt(&package)?;
+        let data = aont::decrypt(&package, &self.derived_keys.aont_mask_key)?;
         let expected_size = usize::try_from(block.original_size)
             .map_err(|_| anyhow!("Block {} size too large for this platform", block.id))?;
         if data.len() != expected_size {
@@ -229,9 +320,7 @@ impl BlockStore {
                 .checked_add(block.original_size)
                 .ok_or_else(|| anyhow!("Block range overflow"))?;
 
-            // Check overlap
             if current_offset < read_end && block_end > offset {
-                // Determine intersection
                 let start_in_block = offset.saturating_sub(current_offset);
                 let end_in_block = if read_end < block_end {
                     read_end - current_offset
@@ -239,8 +328,6 @@ impl BlockStore {
                     block.original_size
                 };
 
-                // Optimisation: If we need just a part, we still have to decode the whole block (limitation of Erasure/AONT)
-                // In a production system we might cache this.
                 let block_data = self.read_block(block)?;
                 let start_idx = usize::try_from(start_in_block)
                     .map_err(|_| anyhow!("Block offset too large for this platform"))?;
@@ -287,16 +374,16 @@ impl BlockStore {
         let mut next_id = self.next_available_id()?;
         let mut next_manifest = self.manifest.clone();
         let mut obsolete_blocks = Vec::new();
+        let mut pending_blocks = Vec::new();
 
-        // If inserting at absolute end, we just append.
         if offset == self.manifest.total_size {
             let new_id = Self::take_next_id(&mut next_id)?;
             let new_block = self.create_block(data, new_id, data_shards, parity_shards)?;
-            next_manifest.add_block(new_block);
-            return self.commit_manifest(next_manifest, obsolete_blocks);
+            next_manifest.add_block(new_block.metadata.clone());
+            pending_blocks.push(new_block);
+            return self.commit_manifest(next_manifest, obsolete_blocks, pending_blocks);
         }
 
-        // Find the block to split.
         let mut current_offset: u64 = 0;
         let mut split_index = None;
         let mut split_pos_in_block = 0;
@@ -324,46 +411,45 @@ impl BlockStore {
         }
         let (left_data, right_data) = full_data.split_at(split_idx);
 
-        // Create new blocks.
         let mut new_blocks = Vec::new();
 
-        // 1. Left part (if not empty).
         if !left_data.is_empty() {
             let id = Self::take_next_id(&mut next_id)?;
-            new_blocks.push(self.create_block(
+            let pending = self.create_block(
                 left_data,
                 id,
                 block_to_split.data_shards,
                 block_to_split.parity_shards,
-            )?);
+            )?;
+            new_blocks.push(pending.metadata.clone());
+            pending_blocks.push(pending);
         }
 
-        // 2. Inserted part.
         let id = Self::take_next_id(&mut next_id)?;
-        new_blocks.push(self.create_block(data, id, data_shards, parity_shards)?);
+        let inserted = self.create_block(data, id, data_shards, parity_shards)?;
+        new_blocks.push(inserted.metadata.clone());
+        pending_blocks.push(inserted);
 
-        // 3. Right part (if not empty).
         if !right_data.is_empty() {
             let id = Self::take_next_id(&mut next_id)?;
-            new_blocks.push(self.create_block(
+            let pending = self.create_block(
                 right_data,
                 id,
                 block_to_split.data_shards,
                 block_to_split.parity_shards,
-            )?);
+            )?;
+            new_blocks.push(pending.metadata.clone());
+            pending_blocks.push(pending);
         }
 
         next_manifest.blocks.splice(idx..idx + 1, new_blocks);
         Self::recalc_total_size(&mut next_manifest)?;
 
         obsolete_blocks.push(block_to_split);
-        self.commit_manifest(next_manifest, obsolete_blocks)
+        self.commit_manifest(next_manifest, obsolete_blocks, pending_blocks)
     }
 
     /// Deletes data in range [offset, offset + length).
-    /// This may involve:
-    /// 1. Identifying blocks to remove completely.
-    /// 2. Trimming blocks (read -> cut -> new block).
     pub fn delete_range(&mut self, offset: u64, length: u64) -> Result<()> {
         if length == 0 {
             return Ok(());
@@ -379,6 +465,7 @@ impl BlockStore {
         let mut current_offset: u64 = 0;
         let mut new_blocks = Vec::new();
         let mut obsolete_blocks = Vec::new();
+        let mut pending_blocks = Vec::new();
 
         for block in &self.manifest.blocks {
             let block_start = current_offset;
@@ -386,12 +473,10 @@ impl BlockStore {
                 .checked_add(block.original_size)
                 .ok_or_else(|| anyhow!("Block range overflow"))?;
 
-            // Check intersection
             let overlap_start = u64::max(offset, block_start);
             let overlap_end = u64::min(delete_end, block_end);
 
             if overlap_start < overlap_end {
-                // This block is affected
                 let data = self.read_block(block)?;
                 let start_in_block = usize::try_from(overlap_start - block_start)
                     .map_err(|_| anyhow!("Delete offset too large for this platform"))?;
@@ -401,33 +486,26 @@ impl BlockStore {
                     return Err(anyhow!("Delete range is inconsistent with block data"));
                 }
 
-                // Keep Left Part
                 if start_in_block > 0 {
                     let left_data = &data[0..start_in_block];
                     let id = Self::take_next_id(&mut next_id)?;
-                    new_blocks.push(self.create_block(
-                        left_data,
-                        id,
-                        block.data_shards,
-                        block.parity_shards,
-                    )?);
+                    let pending =
+                        self.create_block(left_data, id, block.data_shards, block.parity_shards)?;
+                    new_blocks.push(pending.metadata.clone());
+                    pending_blocks.push(pending);
                 }
 
-                // Keep Right Part
                 if end_in_block < data.len() {
                     let right_data = &data[end_in_block..];
                     let id = Self::take_next_id(&mut next_id)?;
-                    new_blocks.push(self.create_block(
-                        right_data,
-                        id,
-                        block.data_shards,
-                        block.parity_shards,
-                    )?);
+                    let pending =
+                        self.create_block(right_data, id, block.data_shards, block.parity_shards)?;
+                    new_blocks.push(pending.metadata.clone());
+                    pending_blocks.push(pending);
                 }
 
                 obsolete_blocks.push(block.clone());
             } else {
-                // Not affected, keep as is
                 new_blocks.push(block.clone());
             }
 
@@ -438,26 +516,127 @@ impl BlockStore {
         next_manifest.blocks = new_blocks;
         Self::recalc_total_size(&mut next_manifest)?;
 
-        self.commit_manifest(next_manifest, obsolete_blocks)
+        self.commit_manifest(next_manifest, obsolete_blocks, pending_blocks)
+    }
+
+    fn write_envelope_file(&self, path: &Path, envelope: &ChunkEnvelope) -> Result<()> {
+        let bytes = chunk_format::encode_envelope(envelope, &self.derived_keys.meta_mac_key)?;
+        let expected_hash = blake3::hash(&bytes).to_hex().to_string();
+        io_guard::write_atomic_verified(path, &bytes, &expected_hash, self.io_options)?;
+        Ok(())
+    }
+
+    fn persist_manifest_artifacts(
+        &self,
+        manifest: &Manifest,
+        pending_blocks: &[PendingBlock],
+    ) -> Result<()> {
+        let fail_marker = self.root_path.join(TEST_MANIFEST_FAIL_MARKER);
+        if fail_marker.exists() {
+            return Err(anyhow!(
+                "Manifest commit aborted due to failure marker: {}",
+                fail_marker.display()
+            ));
+        }
+
+        let (manifest_blob_zstd, manifest_hash) =
+            manifest_recovery::encode_manifest_snapshot(manifest)?;
+        let mut written_paths = Vec::new();
+
+        let write_result = (|| -> Result<()> {
+            let mut metadata_copies = 0usize;
+
+            for pending in pending_blocks {
+                let total_shards = pending
+                    .metadata
+                    .data_shards
+                    .checked_add(pending.metadata.parity_shards)
+                    .ok_or_else(|| anyhow!("Block {} shard count overflow", pending.metadata.id))?;
+                if pending.shards.len() != total_shards {
+                    return Err(anyhow!(
+                        "Pending block {} shard count mismatch ({} != {})",
+                        pending.metadata.id,
+                        pending.shards.len(),
+                        total_shards
+                    ));
+                }
+
+                for (i, shard_payload) in pending.shards.iter().enumerate() {
+                    let envelope = ChunkEnvelope::data_shard(
+                        pending.metadata.id,
+                        i,
+                        pending.metadata.data_shards,
+                        pending.metadata.parity_shards,
+                        shard_payload.clone(),
+                        manifest.epoch,
+                        manifest_hash,
+                        manifest_blob_zstd.clone(),
+                    );
+                    let path = self
+                        .root_path
+                        .join(format!("block_{}_{}.bin", pending.metadata.id, i));
+                    self.write_envelope_file(&path, &envelope)?;
+                    written_paths.push(path);
+                    metadata_copies += 1;
+                }
+            }
+
+            let mut fallback_idx = 0usize;
+            while metadata_copies < METADATA_COPY_TARGET {
+                let path = self
+                    .root_path
+                    .join(format!("meta_{}_{}.bin", manifest.epoch, fallback_idx));
+                fallback_idx = fallback_idx
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("Meta fallback index overflow"))?;
+
+                if path.exists() {
+                    continue;
+                }
+
+                let envelope = ChunkEnvelope::meta_only(
+                    manifest.epoch,
+                    manifest_hash,
+                    manifest_blob_zstd.clone(),
+                );
+                self.write_envelope_file(&path, &envelope)?;
+                written_paths.push(path);
+                metadata_copies += 1;
+            }
+
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            for path in written_paths {
+                let _ = fs::remove_file(path);
+            }
+            return Err(err);
+        }
+
+        Ok(())
     }
 
     fn commit_manifest(
         &mut self,
         mut next_manifest: Manifest,
         obsolete_blocks: Vec<BlockMetadata>,
+        pending_blocks: Vec<PendingBlock>,
     ) -> Result<()> {
-        next_manifest.epoch = next_manifest
+        next_manifest.epoch = self
+            .manifest
             .epoch
             .checked_add(1)
             .ok_or_else(|| anyhow!("Manifest epoch overflow"))?;
         next_manifest.validate()?;
-        next_manifest.save_tmr(&self.root_path, self.io_options)?;
+        self.persist_manifest_artifacts(&next_manifest, &pending_blocks)?;
 
         self.manifest = next_manifest;
 
         for block in &obsolete_blocks {
             self.delete_block_files_best_effort(block);
         }
+        self.cleanup_old_meta_files_best_effort(self.manifest.epoch);
 
         Ok(())
     }

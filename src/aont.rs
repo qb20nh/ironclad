@@ -14,12 +14,12 @@ pub const NONCE_SIZE: usize = 12;
 ///
 /// 1. Generates a random ephemeral key $K_{rand}$.
 /// 2. Encrypts `data` using AES-256-GCM with $K_{rand}$.
-/// 3. Computes hash of ciphertext: $H = \text{BLAKE3}(C)$.
+/// 3. Computes keyed mask over ciphertext: $H = \text{BLAKE3}_{key}(C)$.
 /// 4. Computes canary block: $X = K_{rand} \oplus H$.
 ///
 /// Returns a concatenated vector: `[Nonce (12) | Ciphertext (N) | Tag (16) | Canary (32)]`
 /// Note: AES-GCM produces Ciphertext + Tag. We treat (Ciphertext + Tag) as "C" for hashing.
-pub fn encrypt(data: &[u8]) -> Result<Vec<u8>> {
+pub fn encrypt(data: &[u8], aont_mask_key: &[u8; 32]) -> Result<Vec<u8>> {
     // 1. Generate random ephemeral key K_rand
     let mut key_bytes = [0u8; BLOCK_SIZE];
     OsRng.fill_bytes(&mut key_bytes);
@@ -48,8 +48,8 @@ pub fn encrypt(data: &[u8]) -> Result<Vec<u8>> {
     payload.extend_from_slice(&nonce_bytes);
     payload.extend_from_slice(&ciphertext_with_tag);
 
-    // Compute H = BLAKE3(Payload)
-    let hash = blake3::hash(&payload);
+    // Compute H = keyed BLAKE3(Payload)
+    let hash = blake3::keyed_hash(aont_mask_key, &payload);
 
     // 4. Entangle: X = K_rand ^ H
     let mut x = [0u8; BLOCK_SIZE];
@@ -66,7 +66,7 @@ pub fn encrypt(data: &[u8]) -> Result<Vec<u8>> {
 /// Decrypts an Ironclad AONT package.
 ///
 /// Input format: `[Nonce (12) | Ciphertext (N) | Tag (16) | Canary (32)]`
-pub fn decrypt(package: &[u8]) -> Result<Vec<u8>> {
+pub fn decrypt(package: &[u8], aont_mask_key: &[u8; 32]) -> Result<Vec<u8>> {
     if package.len() < NONCE_SIZE + 16 + BLOCK_SIZE {
         return Err(anyhow!("Package too short"));
     }
@@ -78,8 +78,8 @@ pub fn decrypt(package: &[u8]) -> Result<Vec<u8>> {
     // c_part contains: Nonce | Ciphertext | Tag
     // x_part contains: Canary X
 
-    // 1. Recompute H = BLAKE3(C)
-    let hash = blake3::hash(c_part);
+    // 1. Recompute H = keyed BLAKE3(C)
+    let hash = blake3::keyed_hash(aont_mask_key, c_part);
 
     // 2. Recover Key: K_rand = X ^ H
     let mut key_bytes = [0u8; BLOCK_SIZE];
@@ -104,21 +104,24 @@ pub fn decrypt(package: &[u8]) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    const TEST_MASK_KEY: [u8; 32] = [9u8; 32];
+    const WRONG_MASK_KEY: [u8; 32] = [8u8; 32];
+
     #[test]
     fn test_round_trip() {
         let data = b"The quick brown fox jumps over the lazy dog. 1234567890";
-        let package = encrypt(data).expect("Encryption failed");
+        let package = encrypt(data, &TEST_MASK_KEY).expect("Encryption failed");
 
         assert_ne!(data.as_slice(), package.as_slice());
 
-        let decrypted = decrypt(&package).expect("Decryption failed");
+        let decrypted = decrypt(&package, &TEST_MASK_KEY).expect("Decryption failed");
         assert_eq!(data.as_slice(), decrypted.as_slice());
     }
 
     #[test]
     fn test_tamper_ciphertext() {
         let data = b"SECRET";
-        let mut package = encrypt(data).unwrap();
+        let mut package = encrypt(data, &TEST_MASK_KEY).unwrap();
 
         // Flip a bit in the ciphertext (somewhere in the middle)
         let idx = NONCE_SIZE + 2;
@@ -131,21 +134,29 @@ mod tests {
         // 2. If we used the correct key, GCM tag would fail.
         // With AONT, the key itself becomes garbage, so GCM decrypt essentially tries to decrypt with a random key.
         // The GCM tag check will almost certainly fail.
-        let res = decrypt(&package);
+        let res = decrypt(&package, &TEST_MASK_KEY);
         assert!(res.is_err());
     }
 
     #[test]
     fn test_tamper_canary() {
         let data = b"SECRET";
-        let mut package = encrypt(data).unwrap();
+        let mut package = encrypt(data, &TEST_MASK_KEY).unwrap();
 
         // Flip a bit in the canary (last byte)
         let len = package.len();
         package[len - 1] ^= 0x01;
 
         // Key recovery will yield wrong key -> GCM tag failure
-        let res = decrypt(&package);
+        let res = decrypt(&package, &TEST_MASK_KEY);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_wrong_mask_key_fails_decrypt() {
+        let data = b"SECRET";
+        let package = encrypt(data, &TEST_MASK_KEY).expect("encrypt");
+        let res = decrypt(&package, &WRONG_MASK_KEY);
         assert!(res.is_err());
     }
 }
